@@ -49,7 +49,7 @@ from pyproj import Geod
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT / "data"))
-from parcel_calculations import add_improvement_ratio_fields, classify_property_refined  # noqa: E402
+from parcel_calculations import add_improvement_ratio_fields, classify_property_refined, gis_area_sqft  # noqa: E402
 from cloud_utils import get_feature_data_with_geometry  # noqa: E402
 
 DATA_DIR = ROOT / "data" / "jurisidictions" / "data" / "austin"
@@ -160,16 +160,22 @@ parcel = parcel[inside].copy()
 log(f"City-limits filter -> {len(parcel):,}")
 
 # ── 4. dedup, categorize, exempt, refined ───────────────────────────────────
+# Travis taxmaps draws some accounts as several polygons (970 PROP_IDs county-wide, ~220 inside
+# Austin). The left join above copies the ONE PROP.TXT row onto every piece, so values are a
+# broadcast: take `first` and union the geometry. Summing them (what this block used to do)
+# multiplied each account's value by its piece count: PROP_ID 197006 showed $2,400/sqft, and
+# ~$388M land / ~$1.0B market was overstated across 177 accounts (add-city skill §2/§2a).
 ndup = parcel.duplicated(subset=["acct"], keep=False).sum()
+log(f"Rows sharing a PROP_ID (multi-polygon): {ndup:,} "
+    f"({parcel.loc[parcel['acct'].duplicated(keep=False), 'acct'].nunique():,} accounts)")
 if ndup:
-    sum_cols = [c for c in ["tot_appr_val", "land_val", "bld_val"] if c in parcel.columns]
-    cat_cols = [c for c in parcel.columns if c not in set(sum_cols + ["geometry", "acct"])]
-    agg = {c: "sum" for c in sum_cols}; agg.update({c: "first" for c in cat_cols})
-    coll = parcel.groupby("acct", dropna=False).agg(agg).reset_index()
+    cat_cols = [c for c in parcel.columns if c not in ("geometry", "acct")]
+    coll = parcel.groupby("acct", dropna=False).agg({c: "first" for c in cat_cols}).reset_index()
     gu = parcel.groupby("acct", dropna=False)["geometry"].apply(
         lambda gs: unary_union([x for x in gs if x is not None]) if any(x is not None for x in gs) else None)
     coll["geometry"] = gu.values
     parcel = gpd.GeoDataFrame(coll, geometry="geometry", crs=parcel.crs)
+assert not parcel["acct"].duplicated().any(), "acct must be unique after dedup"
 log(f"After dedup -> {len(parcel):,}")
 
 
@@ -208,18 +214,6 @@ ex["property_land_use_refined"] = classify_property_refined(ex, fetch_footprints
 log(f"After exempt/refine -> {len(ex):,}")
 
 # ── 5. Canonical fields — REPORTED-land-size denominator (GIS fallback) ──────
-def gis_area_sqft(geom):
-    if geom is None or geom.is_empty:
-        return np.nan
-    if geom.geom_type == "Polygon":
-        lon, lat = geom.exterior.coords.xy
-        a, _ = geod.polygon_area_perimeter(lon, lat)
-        return abs(a) * 10.763910416709722
-    if geom.geom_type == "MultiPolygon":
-        return sum(gis_area_sqft(p) for p in geom.geoms)
-    return np.nan
-
-
 ex["geometry"] = ex["geometry"].apply(lambda x: x if x is None or x.is_valid else x.buffer(0))
 log("Computing GIS areas...")
 ex["gis_area_sqft"] = ex["geometry"].apply(gis_area_sqft)

@@ -34,6 +34,16 @@ from parquet_registry import list_cities, resolve_city  # noqa: E402
 MB = 1024 * 1024
 
 
+def _md5(path: Path) -> bytes:
+    """Content digest for the upload skip-check (and recorded on the blob for the next run)."""
+    import hashlib
+    h = hashlib.md5()  # noqa: S324 - matches Azure's own Content-MD5 header, not a security use
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.digest()
+
+
 def load_env(path: Path) -> None:
     if not path.exists():
         sys.exit(f"Missing {path}\nCreate it with: AZURE_STORAGE_CONNECTION_STRING=...")
@@ -58,6 +68,36 @@ def city_dir(subdir: str, city_key: str, meta) -> Path:
         if candidate.exists():
             return candidate
     return base / city_key  # default; missing artifacts are reported below
+
+
+# Owner-name columns must never reach a public container. An assessor site exposes a name one
+# lookup at a time; these parquets are bulk downloads on a public CDN, which is a different act.
+# Enforced HERE rather than in ~40 ETLs so it also covers cities added by new contributors.
+# Street addresses are deliberately NOT blocked: a parcel's address is its public identity and is
+# what the popup and the assessors' own search boxes key on.
+# A bare "NAME" column is always an owner name in these feeds (Des Moines and Portland ship
+# 40k and 177k distinct person names under it). Matched EXACTLY so it does not catch
+# TNT_NAME (8 distinct neighbourhoods), StName, or subdivision_name.
+PII_COLUMN_RE = r"(?i)((^|_)(owner|ownername|owner_name|parcel_owner|mail_name|taxpayer)($|_)|^name$)"
+# Per-household circumstances that identify a person's age, veteran status, or debts once joined
+# to a parcel location. The maps never read these.
+SENSITIVE_COLUMN_RE = r"(?i)^(senior_exe|vet_exempt|stars?|starc|amtdelinqu|yrsdelinqu)"
+
+
+def check_no_pii(path: Path) -> list[str]:
+    """Return the disallowed columns in a parcel parquet (empty list = clean).
+
+    Schema-only read, so this stays fast even on a 200 MB roll.
+    """
+    import re
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("WARN  pyarrow missing — cannot screen for owner-name columns")
+        return []
+    names = pq.ParquetFile(path).schema_arrow.names
+    return [c for c in names
+            if re.search(PII_COLUMN_RE, c) or re.search(SENSITIVE_COLUMN_RE, c)]
 
 
 def build_artifacts(city_key: str, meta) -> list[tuple[Path, str]]:
@@ -102,7 +142,7 @@ def main() -> int:
     if not conn:
         sys.exit("AZURE_STORAGE_CONNECTION_STRING not found in data/.env")
     try:
-        from azure.storage.blob import BlobServiceClient
+        from azure.storage.blob import BlobServiceClient, ContentSettings
         from azure.core.exceptions import ResourceNotFoundError
     except ImportError:
         sys.exit("Missing dependency. Run:  python -m pip install azure-storage-blob")
@@ -119,6 +159,18 @@ def main() -> int:
     cc = svc.get_container_client(container)
 
     artifacts = build_artifacts(city_key, meta)
+
+    parcel_path = artifacts[0][0]
+    if parcel_path.exists():
+        bad = check_no_pii(parcel_path)
+        if bad:
+            sys.exit(
+                f"REFUSING TO UPLOAD: {parcel_path.name} carries disallowed column(s): "
+                f"{', '.join(bad)}\n"
+                "These publish owner names or per-household circumstances to a public CDN.\n"
+                "Drop them in the city's ETL export before uploading (street addresses are fine)."
+            )
+
     print(f"Uploading '{city_key}' artifacts to {container} ...")
 
     uploaded = 0
@@ -133,15 +185,29 @@ def main() -> int:
             continue
         size = local.stat().st_size
         blob = cc.get_blob_client(name)
+        digest = _md5(local)
         try:
-            if blob.get_blob_properties().size == size:
-                print(f"SKIP  {name}: already in {container} ({size/MB:.1f} MB, same size)")
+            props = blob.get_blob_properties()
+            remote_md5 = (props.content_settings or {}).get("content_md5")
+            # Content hash, NOT size. A size-only check silently skips a file whose contents
+            # changed without changing its length — which is exactly what land-totals JSONs do
+            # (Provo's went $5.26B -> $6.71B at an identical 76 bytes and never left the laptop).
+            # Blobs uploaded before this change carry no content_md5; those fall back to size,
+            # and re-uploading once records a hash so the next run is exact.
+            if remote_md5 is not None:
+                if bytes(remote_md5) == digest:
+                    print(f"SKIP  {name}: already in {container} ({size/MB:.1f} MB, same content)")
+                    continue
+            elif props.size == size:
+                print(f"SKIP  {name}: already in {container} ({size/MB:.1f} MB, same size, "
+                      f"no stored hash — re-upload to record one)")
                 continue
         except ResourceNotFoundError:
             pass
         print(f"UP    {name} ({size/MB:.1f} MB) -> {container} (4 MB blocks)...")
         with local.open("rb") as fh:
-            blob.upload_blob(fh, overwrite=True, max_concurrency=4)
+            blob.upload_blob(fh, overwrite=True, max_concurrency=4,
+                             content_settings=ContentSettings(content_md5=digest))
         print(f"  done -> {container}/{name}")
         uploaded += 1
     print(f"All artifacts processed. ({uploaded} uploaded)")

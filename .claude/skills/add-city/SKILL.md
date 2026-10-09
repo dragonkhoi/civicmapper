@@ -57,6 +57,56 @@ Dallas accounts. Symptom: a few parcels with absurd values/$-per-sqft.
 - per-polygon GIS area → **`sum`**; reported account-level area → **`first`**.
 - geometry → `unary_union`.
 
+### 2a. The fragment twin: `drop_duplicates` on GEOMETRY (Chicago, 2026-10, issue #22)
+
+The mirror image of §2, and just as visible. The geometry layer stores one PIN as several
+rows, here pieces of one parcel split by a rail line or road. The script collapses them with
+`drop_duplicates(pin)`, or keeps the largest piece, so **the PIN's whole value lands on one
+fragment** and the rest of the footprint isn't drawn. Chicago PIN 25-13-400-008: a 64-acre
+piece plus a 1.3-acre triangle. The $8M went on the triangle, giving **$145/sqft against $4
+next door** (reported by a Cook County Assessor's Office GIS analyst). Citywide, 4,092 PINs
+were affected, 3,810 acres were missing, and 245 parcels' $/sqft fell more than 10× after
+the fix. A sort before `drop_duplicates` doesn't help, because the pieces often tie on the
+sort key (here both had `pinu=0`), so the piece that survives is arbitrary.
+
+**Rule:** the geometry footprint must exist at the **same grain as the value it is divided
+by**. If values are aggregated to a key, `unary_union` every geometry row with that key
+before computing area. **Never use `drop_duplicates`, `keep="first"` or keep-largest on
+geometry rows.** Keep-largest is less wrong but still loses area. (Unioning overlapping
+duplicates is harmless: they add no area.)
+
+**Sum vs. first: decide by what is duplicated, not by habit.**
+- Several *value records* with distinct values for one footprint (condo units, Chicago's
+  per-unit 14-digit PINs rolling up to the 10-digit PIN) → **sum** the values.
+- One account's value broadcast to several *polygons* (multi-part parcels) → **first**, as in §2.
+- Check before choosing: `df.groupby(key)[value].nunique().gt(1).sum()`. 0 means it's a
+  broadcast, so take first; summing would multiply the value.
+
+**Preflight on the RAW geometry (log it on every run):**
+```python
+d = raw[raw[key].duplicated(keep=False)]
+print("keys with >1 geometry row:", d[key].nunique())   # nonzero -> you must union
+```
+**Post-flight on the FINAL output:** `final[key].duplicated().sum() == 0`, and the land total
+per unique account must equal the roll's land total for the same accounts. A gap in either
+direction means fragment or broadcast.
+
+The 2026-10 repo audit also found this bug class in **Baltimore**. Fixed 2026-10-02: 993
+BLOCKLOTs were broadcast across 2–6 rows each. The shipped file put the full value on every
+piece (~$132M land double-counted), and the script would have summed it instead. Removing the
+duplicates also cleared Baltimore's only two `likely_remnant` slivers. Both were stray pieces of
+multi-polygon lots, meaning **the remnant filter was masking this bug**. `run_baltimore.py`
+asserts that values are identical across a key's rows before taking `first`, which is the
+pattern to copy. **Austin** was fixed the same day. `run_austin.py` left-joined the one PROP.TXT row
+onto every taxmaps piece and then SUMMED it: 177 accounts, $389M land / $1.02B market
+overstated (PROP_ID 197006 showed $2,400/sqft). The TCAD export is a manual Cloudflare-gated
+download and wasn't on disk, so the shipped parquet was corrected in place by dividing by N.
+N = the account's pieces inside the city. Every value divided by N exactly, and value/N matched
+the taxmaps layer's own `market_value` (median ratio 1.00, vs 2.00/3.00 before). **Trick worth
+reusing:** values summed N× from whole-dollar rolls are exactly divisible by N, and the
+taxmaps/ArcGIS layer often carries its own value fields to check against. Still open:
+**Charlottesville** (`run_charlottesville.py:270` keeps one piece; 5 IDs).
+
 ## 3. Sliver remnants → meaningless $/sqft spikes
 
 Tiny fragment polygons (<500 sqft) carry a real account value → astronomical $/sqft. Flag
@@ -104,6 +154,11 @@ them in the ETL: `likely_remnant = (land_area_sqft < 500)`. Two-layer fix:
   starting `EX-`). Where there's no flag, fall back to state-class `X*` + an owner-keyword
   heuristic (city/county/state/ISD/university). Exclude `Utility`, `Mineral`, and
   `Personal Property/Inventory` categories from the shipped set.
+- **Some assessors APPRAISE exempt property too** (St. Louis County MO: Washington University
+  and the county government center carry full appraised + assessed values, coded "Commercial").
+  A class/land-use exempt test leaves them in. Look for a separate tax-status code — St. Louis
+  County's is `TAXCODE` (A = taxable, everything else an exemption type; lookup table item
+  `d71ee5cf9cef4137b9781042abae20a9`). See `run_stlouis.py`.
 
 ## 6. Condos & multi-record parcels (a documented trap)
 
@@ -116,7 +171,8 @@ Condos are the classic parcel-data landmine — see `docs/add-city-playbook.md` 
 Handling already in the repo:
 - `run_fort_collins.py` — the sophisticated version: common-area/association detection,
   `CONDO_PARENT_MIN_RATIO`, condo-category merge. Copy from here for condo-heavy assessor feeds.
-- `run_baltimore.py` — the reference sum-values / first-categoricals / union-geometry dedup.
+- Account dedup reference: the `ndup` block in `run_seattle.py` / `run_duluth.py`
+  (first-value, union-geometry), or `run_baltimore.py` §3, which also asserts the broadcast first (see §2a).
 
 **Account-level dedup alone does NOT handle condos** — condo units have *separate* accounts,
 so `groupby(account)` won't merge them. Whether you need explicit condo logic depends on the
@@ -200,6 +256,49 @@ lots like townhomes — do NOT fill them).
 Olympia result: 806 unit stubs → 94 development parcels (99% onto real common-area land); rendered
 land $/sqft max 14,750 → 155; condos render as proper blocks instead of a forest of pencils.
 
+### 6c. When units have NO polygon at all — look for a county ADDRESS-POINT layer
+
+Olympia's units are tiny *stubs*; the other failure mode is units with **no geometry whatsoever**
+(Gwinnett County GA: 0 of 1,402 condo records mapped). The development's land is a `$0`
+"condo common area" parcel, so a naive build ships acres of $0 holes and loses the value
+entirely. Don't conclude there's no key and document it as unfixable — **check the county's
+address-point layer first.** Gwinnett's (`Address_Points/FeatureServer/16` — note the layer id
+isn't 0) gives every unit a `PIN`, a **`COMMONPIN`** naming its common-area parcel, and a
+coordinate: an exact unit→development key *and* a spatial city test. 749 units → 31
+developments, +$20.3M land. Most county GIS portals publish one; it's usually named
+`Address_Points`/`Site_Addresses` and is worth probing before any address- or PIN-prefix
+heuristic.
+
+Three things that will silently corrupt this merge:
+- **A municipality/city field on the address layer is a POSTAL (MSAG) label, not a jurisdiction** —
+  only 1,170 of 2,294 points labelled 'DULUTH' were inside the city. Clip **spatially**, always.
+- **Exclude units already mapped as their own polygon** (apartment complexes) or you double-count.
+- **Common-area/HOA class records are NOT units.** One stray $0 record won the dominant-class vote
+  for a single-record "development" and silently re-labelled the city's only hotel as Common Area.
+
+Calibrate residential and commercial separately: assessors often give **commercial** condo units a
+token land value (Gwinnett: $1,000 each, all value in the building), so those merge to ~$0.15/sqft
+against a $10 median. That's the assessor's own number — publish it and note it, don't invent a
+replacement (Seattle Westlake Center precedent).
+
+### 6d. When the assessor never splits condo land at all (New England: MA, RI, CT)
+
+Massachusetts (and Providence RI, and CT CAMA) assess a condo unit's WHOLE value as building:
+unit `LAND = 0`, and the lot area sits on a $0 condo master record (Boston `LU=CM`, Cambridge
+`CONDO-BLDG`). There is no land figure anywhere to merge. Where condos are a small share,
+ship the $0 and let the gp-error layer flag it (Providence, Hartford metro). Where they are a
+large share — Greater Boston: 17k lots, $110B, 32% of taxable value — the land map is
+unreadable without an estimate, so `run_boston.py` estimates it: lot area x median land $/sqft
+of the 15 nearest assessor-valued non-condo parcels in the same town, capped at 70% of the lot's
+value, flagged `condo_land_imputed = 1`, assessor figure kept in `assessor_land_value`,
+`--no-condo-impute` to turn it off. Gate the estimate on a real condo regime (a unit or master
+record on the lot), NOT merely "land = 0": ~300 Boston commercial buildings are $0-land because
+they sit on air rights or ground leases, and a taxable building on EXEMPT land (Massport, BPDA,
+hospital leases) is genuinely $0 land to its owner. **MassGIS's statewide L3 layer
+(`Massachusetts_Property_Tax_Parcels`) is a one-stop geometry+values source for every MA town
+except Boston, whose roll there is stale (FY2023 in 2026)** — use data.boston.gov + Parcels26 for
+Boston.
+
 ## 7. Frontend + deploy
 
 - **`upload_city_dev.py <city>` is the consolidated, registry-driven uploader** — it pushes
@@ -249,6 +348,8 @@ land $/sqft max 14,750 → 155; condos render as proper blocks instead of a fore
   timeouts × retries × cells → can spin 70+ min). It's transient — kill and re-run usually
   clears it first try. Set a Monitor on the log for `fuel features|Done!|Bailing|Traceback`
   to catch the outcome fast instead of waiting.
+  If `overpass-api.de` is DOWN outright (curl to `/api/status` times out on both IPs — seen
+  2026-09-28), point osmnx at a mirror: `OSMNX_OVERPASS_URL=https://maps.mail.ru/osm/tools/overpass/api`.
 - **PMTiles bake on Windows uses WSL**: `--wsl` (tippecanoe + pmtiles live in WSL). Verify a
   city's PMTiles contains all three expected layers with
   `wsl bash -c "pmtiles show --metadata <file>"` (expect `parcels` z13-14, `parcels_low` z0-12,
@@ -273,6 +374,13 @@ land $/sqft max 14,750 → 155; condos render as proper blocks instead of a fore
 
 ## 9. Popups: derive, don't bake
 
-Land size / building size in the popup are **derived on demand** as `value ÷ value-per-sqft`
-(see `buildPopupHTML` in `main.ts`) — both are already in the tile props for every city. Don't
-add data columns or re-bake for values you can compute client-side.
+Land size in the popup is **derived on demand** (see `buildPopupHTML` in `main.ts`). Since the
+2026-07-13 bake, **per-sqft rates are NOT in PMTiles tile props.** The bake drops
+`*_per_sqft` and the map computes `value ÷ (land_area_acres·43560)`. Anything that reads a
+`*_per_sqft` prop directly from a tile feature gets `undefined`. Use `PER_SQFT_SRC` /
+`perSqftExpr`, or the popup's derive step, instead. (The popup printed "—" for every per-sqft row
+on every PMTiles city until 2026-10; issue #22.) The bake also aliases
+`current_full_land_value` → `REALLANDVA`. The popup hides that alias when the city dictionary
+labels the canonical column. Otherwise the core label "Land *Assessed* Value" would show a
+*market* value, which is wrong in fractional-assessment states (Cook County 10/25%, GA 40%).
+Don't add data columns or re-bake for values you can compute client-side.

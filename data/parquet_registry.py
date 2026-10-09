@@ -99,6 +99,11 @@ CITY_PARQUETS: dict[str, CityParquet] = {
     "richmond": CityParquet(
         city="richmond", state="va", legacy_filename="richmond-va-parcels.parquet"
     ),
+    # City of Lynchburg, VA — the independent city (FIPS 51680), NOT Lynchburg TN
+    # (Moore County) and not the surrounding Campbell/Bedford/Amherst County land.
+    "lynchburg": CityParquet(
+        city="lynchburg", state="va", legacy_filename="lynchburg-va-parcels.parquet"
+    ),
     "olympia": CityParquet(
         city="olympia", state="wa", legacy_filename="olympia-wa-parcels.parquet"
     ),
@@ -109,9 +114,28 @@ CITY_PARQUETS: dict[str, CityParquet] = {
         city="vancouver", state="wa", legacy_filename="vancouver-wa-parcels.parquet"
     ),
     "dmv": CityParquet(city="dmv", state="dc", legacy_filename="dmv-dc-parcels.parquet"),
+    # Duluth GA (Gwinnett County, metro Atlanta) — NOT Duluth MN. A future Duluth MN
+    # needs its own key; this one holds the plain `duluth` slug.
+    "duluth": CityParquet(city="duluth", state="ga", legacy_filename="duluth-ga-parcels.parquet"),
+    "provo": CityParquet(city="provo", state="ut", legacy_filename="provo-ut-parcels.parquet"),
+    # City of Providence, RI (RI has no county government; the city is the assessing unit).
+    "providence": CityParquet(
+        city="providence", state="ri", legacy_filename="providence-ri-parcels.parquet"
+    ),
+    # City of Culver City, CA (Los Angeles County Assessor roll, clipped to the city boundary).
+    "culvercity": CityParquet(
+        city="culvercity", state="ca", legacy_filename="culvercity-ca-parcels.parquet"
+    ),
     "washington": CityParquet(
         city="washington", state="dc", legacy_filename="washington-dc-parcels.parquet"
     ),
+    # Greater Boston, MA: Boston + Cambridge + Somerville + Brookline stitched into one city
+    # (run_boston.py; `jurisdiction` column drives the region toggle).
+    "boston": CityParquet(city="boston", state="ma", legacy_filename="boston-ma-parcels.parquet"),
+    # St. Louis, MO: the independent City of St. Louis (FIPS 29510, own assessor) + St. Louis
+    # County (29189) stitched into one city (run_stlouis.py; `jurisdiction` + `municipality`
+    # columns drive the region toggles). Missouri side only.
+    "stlouis": CityParquet(city="stlouis", state="mo", legacy_filename="stlouis-mo-parcels.parquet"),
     "hartfordmetro": CityParquet(
         city="hartfordmetro", state="ct", legacy_filename="hartfordmetro-ct-parcels.parquet"
     ),
